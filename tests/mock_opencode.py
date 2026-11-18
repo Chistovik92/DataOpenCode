@@ -6,7 +6,7 @@ import sys
 version = os.environ.get("MOCK_OPENCODE_VERSION", "2.3.2")
 role = os.environ.get("MOCK_OPENCODE_ROLE", "source")
 state = Path(os.environ["MOCK_OPENCODE_STATE"])
-args = sys.argv[1:]
+args = [arg for arg in sys.argv[1:] if arg != "--standalone"]
 
 
 def sessions(directory):
@@ -60,7 +60,7 @@ elif version.startswith("1.") and args[:2] == ["session", "list"]:
 elif version.startswith("2.") and args[:3] == ["api", "get", "/api/session"]:
     directory = state / ("exported" if role == "source" else "imported")
     items = [{"id": path.stem} for path in sessions(directory)]
-    print(json.dumps({"data": items, "cursor": None}))
+    print(json.dumps({"data": items, "cursor": {"previous": None, "next": None}}))
 elif version.startswith("1.") and args[:1] == ["export"]:
     output_session(state / "exported", args[1])
 elif version.startswith("2.") and args[:2] == ["session", "export"]:

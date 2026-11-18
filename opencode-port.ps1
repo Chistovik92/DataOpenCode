@@ -449,10 +449,11 @@ function Get-OpenCodeSessions([string]$Cli, [int]$Major) {
   do {
     $uri = '/api/session'
     if ($cursor) { $uri += '?cursor=' + [uri]::EscapeDataString($cursor) }
-    $raw = Invoke-OpenCodeNative -Cli $Cli -CliArgs @('api', 'get', $uri)
+    $raw = Invoke-OpenCodeNative -Cli $Cli -CliArgs @('api', 'get', $uri, '--standalone')
     $response = $raw | ConvertFrom-Json
     $items += @(Get-Prop $response 'data' @())
-    $next = Get-Prop $response 'cursor' $null
+    $cursorInfo = Get-Prop $response 'cursor' $null
+    $next = if ($cursorInfo -is [System.Management.Automation.PSCustomObject]) { Get-Prop $cursorInfo 'next' $null } else { $cursorInfo }
     if ($next -and -not $seen.Add([string]$next)) { throw 'API /api/session вернул повторяющийся cursor.' }
     $cursor = $next
   } while ($cursor)
@@ -668,7 +669,11 @@ function Convert-V2SessionToV1($Data, [string]$Directory) {
 
 function Backup-SessionStorage([string]$Cli, [int]$Major, $Paths) {
   $database = $null
-  try { $database = (Invoke-OpenCodeNative -Cli $Cli -CliArgs @('debug', 'paths', 'db')).Trim() } catch { }
+  try {
+    $debugArgs = @('debug', 'paths', 'db')
+    if ($Major -eq 2) { $debugArgs += '--standalone' }
+    $database = (Invoke-OpenCodeNative -Cli $Cli -CliArgs $debugArgs).Trim()
+  } catch { }
   if (-not $database) { $database = Join-Path $Paths.DataDir 'opencode.db' }
   foreach ($suffix in @('', '-wal', '-shm')) {
     $file = $database + $suffix
@@ -774,7 +779,7 @@ function Invoke-Export {
         if ($id -notmatch '^ses_[A-Za-z0-9_-]+$') { throw "CLI вернул некорректный session ID." }
         if (-not $ids.Add($id)) { continue }
         $destination = Join-Path $sessionRoot "$id.json"
-        $cliArgs = if ($major -eq 1) { @('export', $id) } else { @('session', 'export', $id) }
+        $cliArgs = if ($major -eq 1) { @('export', $id) } else { @('session', 'export', $id, '--standalone') }
         Invoke-OpenCodeNative -Cli $cli -CliArgs $cliArgs -OutputFile $destination
         $check = Read-JsonFile $destination
         if (-not $check.Ok -or [string](Get-Prop (Get-Prop $check.Data 'info' $null) 'id' '') -ne $id) {
@@ -1101,7 +1106,7 @@ function Invoke-Import {
         if (-not (Test-Path -LiteralPath $SessionDirectory -PathType Container)) {
           New-Item -ItemType Directory -Path $SessionDirectory -Force | Out-Null
         }
-        $cliArgs = if ($targetMajor -eq 1) { @('import', $session.File) } else { @('session', 'import', $session.File, '--directory', $SessionDirectory) }
+        $cliArgs = if ($targetMajor -eq 1) { @('import', $session.File) } else { @('session', 'import', $session.File, '--directory', $SessionDirectory, '--standalone') }
         Invoke-OpenCodeNative -Cli $targetCli -CliArgs $cliArgs
       }
     }
