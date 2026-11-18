@@ -38,6 +38,8 @@ param(
   [switch]$OverwriteEnv,
   [switch]$DryRun,
   [switch]$DryRunExport,
+  [switch]$SkipSessions,
+  [string]$SessionDirectory = (Get-Location).Path,
   [string]$HomeDir = $env:USERPROFILE
 )
 
@@ -45,7 +47,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $script:Format = 'opencode-port'
-$script:Version = 1
+$script:Version = 2
 
 function Say([string]$Text, [string]$Color = 'Gray') {
   Write-Host $Text -ForegroundColor $Color
@@ -208,6 +210,35 @@ function Merge-JsonNode($Base, $Overlay) {
   [pscustomobject]$result
 }
 
+# Аддитивный вариант: при конфликте сохраняется локальное значение, а из архива
+# добавляются только отсутствующие провайдеры, модели и поля их настроек.
+function Merge-JsonNodeAdditive($Local, $Incoming) {
+  if ($null -eq $Local) { return $Incoming }
+  if ($null -eq $Incoming) { return $Local }
+  if ($Local -isnot [System.Management.Automation.PSCustomObject] -or $Incoming -isnot [System.Management.Automation.PSCustomObject]) { return $Local }
+
+  $result = [ordered]@{}
+  foreach ($p in $Local.PSObject.Properties) { $result[$p.Name] = $p.Value }
+  foreach ($p in $Incoming.PSObject.Properties) {
+    if ($result.Contains($p.Name)) {
+      $result[$p.Name] = Merge-JsonNodeAdditive $result[$p.Name] $p.Value
+    } else {
+      $result[$p.Name] = $p.Value
+    }
+  }
+  [pscustomobject]$result
+}
+
+function Select-ProviderConfig($Config) {
+  $result = [ordered]@{}
+  foreach ($name in 'provider', 'providers') {
+    $value = Get-Prop $Config $name $null
+    if ($value -is [System.Management.Automation.PSCustomObject]) { $result[$name] = $value }
+  }
+  if ($result.Count -eq 0) { return $null }
+  [pscustomobject]$result
+}
+
 function Write-JsonFile([string]$Path, $Object) {
   $json = $Object | ConvertTo-Json -Depth 100
   $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -218,8 +249,39 @@ function Backup-File([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $backup = "$Path.$stamp.bak"
-  Copy-Item -LiteralPath $Path -Destination $backup -Force
+  Copy-Item -LiteralPath $Path -Destination $backup
   $backup
+}
+
+function Backup-Directory([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $null }
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $backup = "$Path.$stamp.bak"
+  Copy-Item -LiteralPath $Path -Destination $backup -Recurse
+  $backup
+}
+
+function Copy-DirectoryContentsAdditive([string]$Source, [string]$Destination) {
+  $sourceRoot = [System.IO.Path]::GetFullPath($Source)
+  if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+  $added = @()
+  foreach ($item in Get-ChildItem -LiteralPath $Source -Recurse -Force) {
+    $relative = $item.FullName.Substring($sourceRoot.Length).TrimStart('\', '/')
+    $target = Join-Path $Destination $relative
+    if ($item.PSIsContainer) {
+      if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+      continue
+    }
+    if (Test-Path -LiteralPath $target) {
+      Say "= .opencode\$relative: локальный файл сохранён" 'DarkGray'
+      continue
+    }
+    $parent = Split-Path -Parent $target
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    Copy-Item -LiteralPath $item.FullName -Destination $target
+    $added += $relative
+  }
+  $added
 }
 
 function Copy-DirectoryContents([string]$Source, [string]$Destination) {
@@ -239,6 +301,43 @@ function Compress-ArchiveSafe([string]$SourceDir, [string]$Destination) {
   }
   if (Test-Path -LiteralPath $Destination -PathType Leaf) { Remove-Item -LiteralPath $Destination -Force }
   Compress-Archive -Path $SourceDir -DestinationPath $Destination -CompressionLevel Optimal
+}
+
+function Expand-ArchiveSafe([string]$ArchivePath, [string]$Destination) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $archive = $null
+  try {
+    $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $ArchivePath).Path)
+    $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $archive.Entries) {
+      $name = $entry.FullName.Replace('\', '/')
+      if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name -match '^[A-Za-z]:' -or $name.Contains(':')) {
+        throw "Небезопасный путь в ZIP: $($entry.FullName)"
+      }
+      $segments = @($name -split '/')
+      if ($segments -contains '..' -or $segments -contains '.') { throw "Небезопасный путь в ZIP: $($entry.FullName)" }
+      $target = [System.IO.Path]::GetFullPath((Join-Path $root $name))
+      if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "ZIP path traversal отклонён: $($entry.FullName)"
+      }
+      if (-not $seen.Add($target)) { throw "Повторяющийся путь в ZIP: $($entry.FullName)" }
+    }
+    foreach ($entry in $archive.Entries) {
+      $target = [System.IO.Path]::GetFullPath((Join-Path $root $entry.FullName.Replace('\', '/')))
+      if ([string]::IsNullOrEmpty($entry.Name)) {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        continue
+      }
+      $parent = Split-Path -Parent $target
+      if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+      $input = $entry.Open()
+      $output = [System.IO.File]::Create($target)
+      try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+    }
+  } finally {
+    if ($null -ne $archive) { $archive.Dispose() }
+  }
 }
 
 function Get-DesktopVersion {
@@ -269,8 +368,10 @@ function Invoke-Export {
       $warnings += "$($file.Name): не удалось разобрать (даже с учётом комментариев JSONC) — файл скопирован как есть."
       continue
     }
-    $prov = Get-Prop $parsed.Data 'provider' $null
-    if ($prov -is [System.Management.Automation.PSCustomObject]) { $providers += $prov }
+    foreach ($name in 'provider', 'providers') {
+      $prov = Get-Prop $parsed.Data $name $null
+      if ($prov -is [System.Management.Automation.PSCustomObject]) { $providers += $prov }
+    }
   }
   $providerNames = @()
   foreach ($p in $providers) { $providerNames += @($p.PSObject.Properties.Name) }
@@ -446,10 +547,7 @@ function Invoke-Import {
         $p = Join-Path $archiveConfigDir $name
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
         $parsed = Read-JsonFile $p
-        if (-not $parsed.Ok) {
-          Say "! $name в архиве не разбирается (даже с учётом JSONC-комментариев): $($parsed.Error)" 'Yellow'
-          continue
-        }
+        if (-not $parsed.Ok) { throw "$name в архиве повреждён: $($parsed.Error)" }
         if ($null -ne $parsed.Data) {
           $overlay = Merge-JsonNode $overlay $parsed.Data
           $overlaySources += $name
@@ -463,46 +561,35 @@ function Invoke-Import {
         $p = Join-Path $paths.ConfigDir $name
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
         $parsed = Read-JsonFile $p
-        if ($parsed.Ok -and $null -ne $parsed.Data) {
+        if (-not $parsed.Ok) { throw "Локальный $name повреждён: $($parsed.Error). Импорт остановлен, файл не изменён." }
+        if ($null -ne $parsed.Data) {
           $base = Merge-JsonNode $base $parsed.Data
           $baseSources += $name
         }
       }
 
+      $overlay = Select-ProviderConfig $overlay
       if ($overlay) {
-        # opencode загружает opencode.json, затем opencode.jsonc (jsonc имеет приоритет).
-        # Поэтому результат пишем в файл с наивысшим приоритетом, иначе старый файл
-        # затенит изменённые ключи.
+        # Результат пишем в файл с наивысшим приоритетом, иначе старый файл
+        # затенит добавленные ключи. Локальные конфликтующие значения сохраняем.
         $targetName = 'opencode.json'
         if (Test-Path -LiteralPath (Join-Path $paths.ConfigDir 'opencode.jsonc') -PathType Leaf) {
           $targetName = 'opencode.jsonc'
         }
         $targetPath = Join-Path $paths.ConfigDir $targetName
 
-        $merged = Merge-JsonNode $base $overlay
-        $desc = "merge -> $targetName"
+        $merged = Merge-JsonNodeAdditive $base $overlay
+        $desc = "providers merge -> $targetName"
         if ($baseSources.Count) { $desc += " (локальные: $($baseSources -join ' + '))" }
         $desc += "; архив: $($overlaySources -join ' + ')"
         $changes += $desc
-        Say "> Слияние конфига: $desc" 'Cyan'
+        Say "> Слияние провайдеров: $desc" 'Cyan'
         if ($targetName -eq 'opencode.jsonc') {
           Say '  (локальные комментарии в opencode.jsonc не сохраняются; оригинал — в .bak)' 'DarkGray'
         }
         if (-not $DryRun) {
           Backup-File $targetPath | Out-Null
           Write-JsonFile $targetPath $merged
-        }
-      } else {
-        # Ни один конфиг из архива не разобран — копируем как есть, чтобы не потерять данные.
-        $rawConfigs = @(Get-ChildItem -LiteralPath $archiveConfigDir -Filter 'opencode.json*' -File -ErrorAction SilentlyContinue)
-        foreach ($f in $rawConfigs) {
-          $targetPath = Join-Path $paths.ConfigDir $f.Name
-          $changes += "copy $($f.Name) (как есть)"
-          Say "> $($f.Name) скопирован без слияния (неразборчивый исходник)" 'Yellow'
-          if (-not $DryRun) {
-            Backup-File $targetPath | Out-Null
-            Copy-Item -LiteralPath $f.FullName -Destination $targetPath -Force
-          }
         }
       }
 
