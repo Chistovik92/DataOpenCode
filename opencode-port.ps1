@@ -56,7 +56,7 @@ function Say([string]$Text, [string]$Color = 'Gray') {
 # Strict-mode-safe: значение свойства объекта, если свойство есть; иначе default.
 function Get-Prop($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
-  if ($Object.PSObject.Properties.Name -contains $Name) { return $Object.$Name }
+  if ($null -ne $Object.PSObject.Properties[$Name]) { return $Object.$Name }
   return $Default
 }
 
@@ -242,13 +242,25 @@ function Select-ProviderConfig($Config) {
 function Write-JsonFile([string]$Path, $Object) {
   $json = $Object | ConvertTo-Json -Depth 100
   $utf8 = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($Path, $json, $utf8)
+  $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+  try {
+    [System.IO.File]::WriteAllText($temp, $json, $utf8)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      $replaceBackup = "$Path.$([guid]::NewGuid().ToString('N')).replace.bak"
+      [System.IO.File]::Replace($temp, $Path, $replaceBackup, $true)
+    } else {
+      [System.IO.File]::Move($temp, $Path)
+    }
+  } finally {
+    if (Test-Path -LiteralPath $temp -PathType Leaf) { Remove-Item -LiteralPath $temp -Force }
+  }
 }
 
 function Backup-File([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-  $backup = "$Path.$stamp.bak"
+  $guid = [guid]::NewGuid().ToString('N')
+  $backup = "$Path.$stamp-$guid.bak"
   Copy-Item -LiteralPath $Path -Destination $backup
   $backup
 }
@@ -256,7 +268,8 @@ function Backup-File([string]$Path) {
 function Backup-Directory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $null }
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-  $backup = "$Path.$stamp.bak"
+  $guid = [guid]::NewGuid().ToString('N')
+  $backup = "$Path.$stamp-$guid.bak"
   Copy-Item -LiteralPath $Path -Destination $backup -Recurse
   $backup
 }
@@ -273,7 +286,7 @@ function Copy-DirectoryContentsAdditive([string]$Source, [string]$Destination) {
       continue
     }
     if (Test-Path -LiteralPath $target) {
-      Say "= .opencode\$relative: локальный файл сохранён" 'DarkGray'
+      Say "= .opencode\${relative}: локальный файл сохранён" 'DarkGray'
       continue
     }
     $parent = Split-Path -Parent $target
@@ -310,7 +323,15 @@ function Expand-ArchiveSafe([string]$ArchivePath, [string]$Destination) {
     $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $ArchivePath).Path)
     $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($archive.Entries.Count -gt 10000) { throw 'В ZIP больше 10000 элементов; распаковка отклонена.' }
+    [long]$declaredTotal = 0
     foreach ($entry in $archive.Entries) {
+      if ($entry.Length -gt 1GB) { throw "Элемент ZIP слишком велик: $($entry.FullName)" }
+      $declaredTotal += $entry.Length
+      if ($declaredTotal -gt 2GB) { throw 'Общий распакованный размер ZIP превышает 2 ГБ.' }
+      if ($entry.Length -gt 10MB -and $entry.CompressedLength -gt 0 -and ($entry.Length / $entry.CompressedLength) -gt 1000) {
+        throw "Подозрительная степень сжатия ZIP: $($entry.FullName)"
+      }
       $name = $entry.FullName.Replace('\', '/')
       if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name -match '^[A-Za-z]:' -or $name.Contains(':')) {
         throw "Небезопасный путь в ZIP: $($entry.FullName)"
@@ -323,9 +344,10 @@ function Expand-ArchiveSafe([string]$ArchivePath, [string]$Destination) {
       }
       if (-not $seen.Add($target)) { throw "Повторяющийся путь в ZIP: $($entry.FullName)" }
     }
+    [long]$actualTotal = 0
     foreach ($entry in $archive.Entries) {
       $target = [System.IO.Path]::GetFullPath((Join-Path $root $entry.FullName.Replace('\', '/')))
-      if ([string]::IsNullOrEmpty($entry.Name)) {
+      if ($entry.FullName.EndsWith('/')) {
         New-Item -ItemType Directory -Path $target -Force | Out-Null
         continue
       }
@@ -333,7 +355,14 @@ function Expand-ArchiveSafe([string]$ArchivePath, [string]$Destination) {
       if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
       $input = $entry.Open()
       $output = [System.IO.File]::Create($target)
-      try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+      try {
+        $buffer = New-Object byte[] (1MB)
+        while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+          $actualTotal += $read
+          if ($actualTotal -gt 2GB) { throw 'Фактический распакованный размер ZIP превышает 2 ГБ.' }
+          $output.Write($buffer, 0, $read)
+        }
+      } finally { $output.Dispose(); $input.Dispose() }
     }
   } finally {
     if ($null -ne $archive) { $archive.Dispose() }
@@ -346,12 +375,316 @@ function Get-DesktopVersion {
   try { return (Get-Item -LiteralPath $exe).VersionInfo.FileVersion } catch { return $null }
 }
 
+function Find-OpenCodeCli {
+  if ($env:OPENCODE_PORT_CLI -and (Test-Path -LiteralPath $env:OPENCODE_PORT_CLI -PathType Leaf)) { return $env:OPENCODE_PORT_CLI }
+  $command = Get-Command opencode -ErrorAction SilentlyContinue
+  if ($command -and $command.Source) { return $command.Source }
+  $desktop = Join-Path $env:LOCALAPPDATA 'Programs\@opencode-aidesktop\resources\opencode-cli.exe'
+  if (Test-Path -LiteralPath $desktop -PathType Leaf) { return $desktop }
+  throw 'Не найден opencode CLI. Установите OpenCode или задайте OPENCODE_PORT_CLI.'
+}
+
+function ConvertTo-NativeArgument([string]$Value) {
+  if ($Value.Length -eq 0) { return '""' }
+  if ($Value -notmatch '[\s"]') { return $Value }
+  '"' + ($Value -replace '(\\+)"', '$1$1\"' -replace '(\\+)$', '$1$1' -replace '"', '\"') + '"'
+}
+
+function Invoke-OpenCodeNative {
+  param(
+    [string]$Cli,
+    [string[]]$CliArgs,
+    [string]$OutputFile,
+    [string]$WorkingDirectory = (Get-Location).Path
+  )
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Cli
+  $psi.Arguments = (@($CliArgs | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+  $psi.WorkingDirectory = $WorkingDirectory
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $psi.StandardOutputEncoding = $utf8
+  $psi.StandardErrorEncoding = $utf8
+  $psi.CreateNoWindow = $true
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $psi
+  try {
+    if (-not $process.Start()) { throw 'Не удалось запустить opencode CLI.' }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $null = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0) {
+      throw "opencode CLI завершился с кодом $($process.ExitCode). Подробности скрыты, чтобы не выводить секреты."
+    }
+    if ($OutputFile) {
+      [System.IO.File]::WriteAllText($OutputFile, $stdout, (New-Object System.Text.UTF8Encoding($false)))
+      return
+    }
+    $stdout
+  } finally {
+    $process.Dispose()
+  }
+}
+
+function Get-OpenCodeMajor([string]$Cli) {
+  $text = Invoke-OpenCodeNative -Cli $Cli -CliArgs @('--version')
+  $match = [regex]::Match($text, 'v?(\d+)\.')
+  if (-not $match.Success) { throw 'Не удалось определить версию opencode CLI.' }
+  [int]$match.Groups[1].Value
+}
+
+function Get-OpenCodeSessions([string]$Cli, [int]$Major) {
+  if ($Major -eq 1) {
+    $raw = Invoke-OpenCodeNative -Cli $Cli -CliArgs @('session', 'list', '--format', 'json')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+    return @(($raw | ConvertFrom-Json))
+  }
+  $items = @()
+  $cursor = $null
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  do {
+    $uri = '/api/session'
+    if ($cursor) { $uri += '?cursor=' + [uri]::EscapeDataString($cursor) }
+    $raw = Invoke-OpenCodeNative -Cli $Cli -CliArgs @('api', 'get', $uri)
+    $response = $raw | ConvertFrom-Json
+    $items += @(Get-Prop $response 'data' @())
+    $next = Get-Prop $response 'cursor' $null
+    if ($next -and -not $seen.Add([string]$next)) { throw 'API /api/session вернул повторяющийся cursor.' }
+    $cursor = $next
+  } while ($cursor)
+  $items
+}
+
+function New-EmptyTokens {
+  [pscustomobject][ordered]@{ input = 0; output = 0; reasoning = 0; cache = [pscustomobject][ordered]@{ read = 0; write = 0 } }
+}
+
+function Convert-DataUriToAttachment($Part) {
+  $url = [string](Get-Prop $Part 'url' '')
+  $match = [regex]::Match($url, '^data:([^;,]+)?(;base64)?,(.*)$', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+  if (-not $match.Success -or -not $match.Groups[2].Success) {
+    $external = [ordered]@{
+      data = ''; mime = [string](Get-Prop $Part 'mime' 'application/octet-stream'); source = [pscustomobject][ordered]@{ type = 'uri'; uri = $url }
+    }
+    if (Get-Prop $Part 'filename' $null) { $external.name = $Part.filename }
+    return [pscustomobject]$external
+  }
+  $result = [ordered]@{
+    data = $match.Groups[3].Value
+    mime = [string](Get-Prop $Part 'mime' $(if ($match.Groups[1].Success) { $match.Groups[1].Value } else { 'application/octet-stream' }))
+    source = [pscustomobject][ordered]@{ type = 'inline' }
+  }
+  $filename = Get-Prop $Part 'filename' $null
+  if ($filename) { $result.name = $filename }
+  [pscustomobject]$result
+}
+
+function Convert-V1ToolStateToV2($State) {
+  $status = [string](Get-Prop $State 'status' '')
+  switch ($status) {
+    'pending' { return [pscustomobject][ordered]@{ status = 'streaming'; input = [string](Get-Prop $State 'raw' '') } }
+    'running' {
+      return [pscustomobject][ordered]@{
+        status = 'running'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{}))
+      }
+    }
+    'completed' {
+      $content = @([pscustomobject][ordered]@{ type = 'text'; text = [string](Get-Prop $State 'output' '') })
+      foreach ($attachment in @(Get-Prop $State 'attachments' @())) {
+        $converted = Convert-DataUriToAttachment $attachment
+        $uri = if ($converted.source.type -eq 'uri') { $converted.source.uri } else { 'data:' + $converted.mime + ';base64,' + $converted.data }
+        $content += [pscustomobject][ordered]@{ type = 'file'; uri = $uri; mime = $converted.mime; name = (Get-Prop $converted 'name' $null) }
+      }
+      return [pscustomobject][ordered]@{ status = 'completed'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); content = $content; metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{})) }
+    }
+    'error' {
+      $error = Get-Prop $State 'error' ''
+      if ($error -is [string]) { $error = [pscustomobject][ordered]@{ name = 'UnknownError'; data = [pscustomobject][ordered]@{ message = $error } } }
+      return [pscustomobject][ordered]@{ status = 'error'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); error = $error; metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{})) }
+    }
+    default { throw "Неизвестный статус инструмента V1: $status" }
+  }
+}
+
+function Convert-V1SessionToV2($Data, [string]$Directory) {
+  $source = Get-Prop $Data 'info' $null
+  if ($null -eq $source) { throw 'В V1 transfer отсутствует info.' }
+  $created = [double](Get-Prop (Get-Prop $source 'time' $null) 'created' ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
+  $updated = [double](Get-Prop (Get-Prop $source 'time' $null) 'updated' $created)
+  $info = [ordered]@{
+    id = $source.id; projectID = [string](Get-Prop $source 'projectID' 'global'); cost = [double](Get-Prop $source 'cost' 0)
+    tokens = (Get-Prop $source 'tokens' (New-EmptyTokens)); time = [pscustomobject][ordered]@{ created = $created; updated = $updated }
+    title = [string](Get-Prop $source 'title' 'Imported session'); location = [pscustomobject][ordered]@{ directory = $Directory }
+    metadata = [pscustomobject][ordered]@{ opencodePortV1 = $Data }
+  }
+  $parentID = Get-Prop $source 'parentID' $null
+  if ($parentID) { $info.parentID = $parentID }
+  $messages = @()
+  foreach ($wrapper in @(Get-Prop $Data 'messages' @())) {
+    $message = Get-Prop $wrapper 'info' $null
+    if ($null -eq $message) { throw 'В V1 transfer сообщение без info.' }
+    $parts = @(Get-Prop $wrapper 'parts' @())
+    $messageCreated = [double](Get-Prop (Get-Prop $message 'time' $null) 'created' $created)
+    $metadata = [pscustomobject][ordered]@{ opencodePortV1Info = $message; opencodePortV1Parts = $parts }
+    if ($message.role -eq 'user') {
+      $texts = @($parts | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text })
+      $files = @($parts | Where-Object { $_.type -eq 'file' } | ForEach-Object { Convert-DataUriToAttachment $_ })
+      $item = [ordered]@{ id = $message.id; type = 'user'; time = [pscustomobject][ordered]@{ created = $messageCreated }; text = ($texts -join "`n"); metadata = $metadata }
+      if ($files.Count) { $item.files = $files }
+      $messages += [pscustomobject]$item
+    } elseif ($message.role -eq 'assistant') {
+      $content = @()
+      foreach ($part in $parts) {
+        if ($part.type -in 'text', 'reasoning') {
+          $content += [pscustomobject][ordered]@{ type = $part.type; text = [string]$part.text }
+        } elseif ($part.type -eq 'tool') {
+          $stateTime = Get-Prop (Get-Prop $part 'state' $null) 'time' $null
+          $start = [double](Get-Prop $stateTime 'start' $messageCreated)
+          $end = [double](Get-Prop $stateTime 'end' $start)
+          $content += [pscustomobject][ordered]@{
+            type = 'tool'; id = [string]$part.callID; name = [string]$part.tool; state = (Convert-V1ToolStateToV2 $part.state)
+            time = [pscustomobject][ordered]@{ created = $start; ran = $start; completed = $end }
+          }
+        }
+      }
+      $model = [ordered]@{ providerID = [string](Get-Prop $message 'providerID' 'unknown'); id = [string](Get-Prop $message 'modelID' 'unknown') }
+      if (Get-Prop $message 'variant' $null) { $model.variant = $message.variant }
+      $item = [ordered]@{
+        id = $message.id; type = 'assistant'; agent = [string](Get-Prop $message 'agent' 'default'); model = [pscustomobject]$model
+        content = $content; metadata = $metadata; cost = [double](Get-Prop $message 'cost' 0); tokens = (Get-Prop $message 'tokens' (New-EmptyTokens))
+        time = [pscustomobject][ordered]@{ created = $messageCreated; completed = [double](Get-Prop (Get-Prop $message 'time' $null) 'completed' $messageCreated) }
+      }
+      if (Get-Prop $message 'finish' $null) { $item.finish = $message.finish }
+      if (Get-Prop $message 'error' $null) { $item.error = $message.error }
+      $messages += [pscustomobject]$item
+    } else { throw "Неизвестная роль сообщения V1: $($message.role)" }
+  }
+  [pscustomobject][ordered]@{ info = [pscustomobject]$info; messages = $messages }
+}
+
+function Convert-V2ToolStateToV1($State, [string]$SessionID, [string]$MessageID, [string]$CallID) {
+  $status = [string](Get-Prop $State 'status' '')
+  $start = [double](Get-Prop (Get-Prop $State 'time' $null) 'start' 0)
+  switch ($status) {
+    'streaming' { return [pscustomobject][ordered]@{ status = 'pending'; input = [pscustomobject]@{}; raw = [string](Get-Prop $State 'input' ''); time = [pscustomobject][ordered]@{ start = $start; end = $start } } }
+    'running' { return [pscustomobject][ordered]@{ status = 'running'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{})); time = [pscustomobject][ordered]@{ start = $start } } }
+    'completed' {
+      $texts = @(); $attachments = @()
+      foreach ($content in @(Get-Prop $State 'content' @())) {
+        if ($content.type -eq 'text') { $texts += $content.text }
+        elseif ($content.type -eq 'file') {
+          $attachments += [pscustomobject][ordered]@{ id = "prt_$CallID$($attachments.Count)"; sessionID = $SessionID; messageID = $MessageID; type = 'file'; mime = $content.mime; filename = (Get-Prop $content 'name' $null); url = $content.uri }
+        }
+      }
+      return [pscustomobject][ordered]@{ status = 'completed'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); output = ($texts -join "`n"); title = ''; metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{})); time = [pscustomobject][ordered]@{ start = $start; end = $start }; attachments = $attachments }
+    }
+    'error' {
+      $error = Get-Prop $State 'error' 'Unknown error'
+      if ($error -isnot [string]) { $error = [string](Get-Prop (Get-Prop $error 'data' $null) 'message' 'Unknown error') }
+      return [pscustomobject][ordered]@{ status = 'error'; input = (Get-Prop $State 'input' ([pscustomobject]@{})); error = $error; metadata = (Get-Prop $State 'metadata' ([pscustomobject]@{})); time = [pscustomobject][ordered]@{ start = $start; end = $start } }
+    }
+    default { throw "Неизвестный статус инструмента V2: $status" }
+  }
+}
+
+function Convert-V2SessionToV1($Data, [string]$Directory) {
+  $source = Get-Prop $Data 'info' $null
+  if ($null -eq $source) { throw 'В V2 transfer отсутствует info.' }
+  $created = [double](Get-Prop (Get-Prop $source 'time' $null) 'created' ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
+  $updated = [double](Get-Prop (Get-Prop $source 'time' $null) 'updated' $created)
+  $info = [ordered]@{
+    id = $source.id; projectID = [string](Get-Prop $source 'projectID' 'global'); slug = 'imported'; directory = $Directory
+    title = [string](Get-Prop $source 'title' 'Imported session'); version = 'opencode-port'
+    time = [pscustomobject][ordered]@{ created = $created; updated = $updated }
+    metadata = [pscustomobject][ordered]@{ opencodePortV2 = $Data }
+  }
+  $parentID = Get-Prop $source 'parentID' $null
+  if ($parentID) { $info.parentID = $parentID }
+  $messages = @()
+  $lastUserID = $null
+  foreach ($message in @(Get-Prop $Data 'messages' @())) {
+    $id = [string]$message.id
+    $messageCreated = [double](Get-Prop (Get-Prop $message 'time' $null) 'created' $created)
+    $parts = @()
+    $role = if ($message.type -eq 'assistant') { 'assistant' } else { 'user' }
+    if ($message.type -eq 'user') {
+      if ($message.text) { $parts += [pscustomobject][ordered]@{ id = "prt_$($id)_text"; sessionID = $source.id; messageID = $id; type = 'text'; text = $message.text } }
+      $index = 0
+      foreach ($file in @(Get-Prop $message 'files' @())) {
+        $fileSource = Get-Prop $file 'source' $null
+        $url = if ((Get-Prop $fileSource 'type' '') -eq 'uri') { [string](Get-Prop $fileSource 'uri' '') } else { 'data:' + $file.mime + ';base64,' + [string](Get-Prop $file 'data' '') }
+        if (-not $url) { throw 'Во вложении V2 отсутствуют данные и URI.' }
+        $parts += [pscustomobject][ordered]@{ id = "prt_$($id)_file$index"; sessionID = $source.id; messageID = $id; type = 'file'; mime = $file.mime; filename = (Get-Prop $file 'name' $null); url = $url }
+        $index++
+      }
+    } elseif ($message.type -eq 'assistant') {
+      $index = 0
+      foreach ($content in @(Get-Prop $message 'content' @())) {
+        $partID = "prt_$($id)_$index"
+        if ($content.type -in 'text', 'reasoning') {
+          $part = [ordered]@{ id = $partID; sessionID = $source.id; messageID = $id; type = $content.type; text = $content.text }
+          if ($content.type -eq 'reasoning') { $part.time = [pscustomobject][ordered]@{ start = $messageCreated; end = $messageCreated } }
+          $parts += [pscustomobject]$part
+        } elseif ($content.type -eq 'tool') {
+          $start = [double](Get-Prop (Get-Prop $content 'time' $null) 'created' $messageCreated)
+          $state = Convert-V2ToolStateToV1 $content.state $source.id $id $content.id
+          $state.time = [pscustomobject][ordered]@{ start = $start; end = [double](Get-Prop (Get-Prop $content 'time' $null) 'completed' $start) }
+          $parts += [pscustomobject][ordered]@{ id = $partID; sessionID = $source.id; messageID = $id; type = 'tool'; callID = $content.id; tool = $content.name; state = $state }
+        }
+        $index++
+      }
+    } else {
+      $raw = $message | ConvertTo-Json -Depth 100 -Compress
+      $parts += [pscustomobject][ordered]@{ id = "prt_$($id)_raw"; sessionID = $source.id; messageID = $id; type = 'text'; synthetic = $true; text = $raw }
+    }
+    if ($role -eq 'user') {
+      $messageInfo = [pscustomobject][ordered]@{
+        id = $id; sessionID = $source.id; role = 'user'; time = [pscustomobject][ordered]@{ created = $messageCreated }
+        agent = 'default'; model = [pscustomobject][ordered]@{ providerID = 'unknown'; modelID = 'unknown' }
+      }
+      $lastUserID = $id
+    } else {
+      $model = Get-Prop $message 'model' $null
+      $messageInfo = [ordered]@{
+        id = $id; sessionID = $source.id; role = 'assistant'; parentID = $(if ($lastUserID) { $lastUserID } else { $id })
+        time = [pscustomobject][ordered]@{ created = $messageCreated; completed = [double](Get-Prop (Get-Prop $message 'time' $null) 'completed' $messageCreated) }
+        providerID = [string](Get-Prop $model 'providerID' 'unknown'); modelID = [string](Get-Prop $model 'id' 'unknown')
+        mode = [string](Get-Prop $message 'agent' 'default'); agent = [string](Get-Prop $message 'agent' 'default')
+        path = [pscustomobject][ordered]@{ cwd = $Directory; root = $Directory }; cost = [double](Get-Prop $message 'cost' 0); tokens = (Get-Prop $message 'tokens' (New-EmptyTokens))
+      }
+      if (Get-Prop $model 'variant' $null) { $messageInfo.variant = $model.variant }
+      if (Get-Prop $message 'finish' $null) { $messageInfo.finish = $message.finish }
+      if (Get-Prop $message 'error' $null) { $messageInfo.error = $message.error }
+      $messageInfo = [pscustomobject]$messageInfo
+    }
+    $messages += [pscustomobject][ordered]@{ info = $messageInfo; parts = $parts }
+  }
+  [pscustomobject][ordered]@{ info = [pscustomobject]$info; messages = $messages }
+}
+
+function Backup-SessionStorage([string]$Cli, [int]$Major, $Paths) {
+  $database = $null
+  try { $database = (Invoke-OpenCodeNative -Cli $Cli -CliArgs @('debug', 'paths', 'db')).Trim() } catch { }
+  if (-not $database) { $database = Join-Path $Paths.DataDir 'opencode.db' }
+  foreach ($suffix in @('', '-wal', '-shm')) {
+    $file = $database + $suffix
+    if (Test-Path -LiteralPath $file -PathType Leaf) { Backup-File $file | Out-Null }
+  }
+  $legacy = Join-Path $Paths.DataDir 'storage'
+  if (Test-Path -LiteralPath $legacy -PathType Container) { Backup-Directory $legacy | Out-Null }
+}
+
 function Invoke-Export {
   param(
     [string]$OutputPath,
     [string]$SecretsMode = 'Auth',
     [string[]]$EnvNames = @(),
     [string]$HomeDir = $env:USERPROFILE,
+    [switch]$SkipSessions,
     [switch]$DryRun
   )
 
@@ -427,6 +760,31 @@ function Invoke-Export {
       $warnings += 'Имена переменных заданы (-Env), но -Secrets не включает Vars/All — переменные не экспортированы.'
     }
 
+    $sessionManifest = [pscustomobject][ordered]@{ sourceMajor = $null; count = 0; files = @() }
+    if (-not $SkipSessions) {
+      $cli = Find-OpenCodeCli
+      $major = Get-OpenCodeMajor $cli
+      $sessions = @(Get-OpenCodeSessions $cli $major)
+      $sessionRoot = Join-Path $filesRoot 'sessions'
+      New-Item -ItemType Directory -Path $sessionRoot -Force | Out-Null
+      $files = @()
+      $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+      foreach ($session in $sessions) {
+        $id = [string](Get-Prop $session 'id' '')
+        if ($id -notmatch '^ses_[A-Za-z0-9_-]+$') { throw "CLI вернул некорректный session ID." }
+        if (-not $ids.Add($id)) { continue }
+        $destination = Join-Path $sessionRoot "$id.json"
+        $cliArgs = if ($major -eq 1) { @('export', $id) } else { @('session', 'export', $id) }
+        Invoke-OpenCodeNative -Cli $cli -CliArgs $cliArgs -OutputFile $destination
+        $check = Read-JsonFile $destination
+        if (-not $check.Ok -or [string](Get-Prop (Get-Prop $check.Data 'info' $null) 'id' '') -ne $id) {
+          throw "Экспорт диалога $id вернул повреждённый JSON."
+        }
+        $files += "$id.json"
+      }
+      $sessionManifest = [pscustomobject][ordered]@{ sourceMajor = $major; count = $files.Count; files = $files }
+    }
+
     $manifest = [pscustomobject]@{
       format         = $script:Format
       version        = $script:Version
@@ -438,6 +796,7 @@ function Invoke-Export {
       auth           = $authIncluded
       env            = @($exports | ForEach-Object { [pscustomobject]@{ name = $_.name; scope = $_.scope } })
       configFiles    = @($paths.ConfigFiles | ForEach-Object { $_.Name })
+      sessions       = $sessionManifest
       warnings       = $warnings
     }
     Write-JsonFile (Join-Path $filesRoot 'manifest.json') $manifest
@@ -492,10 +851,7 @@ function Find-ArchiveRoot([string]$Dir) {
 }
 
 function Test-OpencodeRunning {
-  foreach ($n in @('OpenCode', 'opencode')) {
-    if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $true }
-  }
-  return $false
+  return [bool](Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'opencode*' })
 }
 
 function Invoke-Import {
@@ -504,6 +860,7 @@ function Invoke-Import {
     [string]$HomeDir = $env:USERPROFILE,
     [switch]$ApplyEnv,
     [switch]$ForceEnv,
+    [string]$SessionDirectory = (Get-Location).Path,
     [switch]$DryRun
   )
 
@@ -518,7 +875,7 @@ function Invoke-Import {
   New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
   try {
-    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $staging -Force
+    Expand-ArchiveSafe -ArchivePath $ArchivePath -Destination $staging
     $root = Find-ArchiveRoot $staging
     $manifest = Read-JsonFile (Join-Path $root 'manifest.json')
     if (-not $manifest.Ok -or $null -eq $manifest.Data) { throw 'manifest.json повреждён или пуст.' }
@@ -532,8 +889,98 @@ function Invoke-Import {
     }
     $archiveProviders = @(Get-Prop $meta 'providers' @())
 
+    # Все входные JSON проверяются до первого изменения целевой машины.
+    $archiveAuth = Join-Path $root 'data\auth.json'
+    $authMerged = $null
+    $authIncomingNames = @()
+    if (Test-Path -LiteralPath $archiveAuth -PathType Leaf) {
+      $incomingAuth = Read-JsonFile $archiveAuth
+      if (-not $incomingAuth.Ok -or $incomingAuth.Data -isnot [System.Management.Automation.PSCustomObject]) { throw 'data\auth.json в архиве повреждён или имеет неверный формат.' }
+      $authMerged = [ordered]@{}
+      if (Test-Path -LiteralPath $paths.AuthFile -PathType Leaf) {
+        $currentAuth = Read-JsonFile $paths.AuthFile
+        if (-not $currentAuth.Ok -or $currentAuth.Data -isnot [System.Management.Automation.PSCustomObject]) { throw "Локальный auth.json повреждён: $(Get-Prop $currentAuth 'Error' 'неверный формат'). Импорт остановлен." }
+        foreach ($p in $currentAuth.Data.PSObject.Properties) { $authMerged[$p.Name] = $p.Value }
+      }
+      foreach ($p in $incomingAuth.Data.PSObject.Properties) {
+        if (-not $authMerged.Contains($p.Name)) { $authMerged[$p.Name] = $p.Value }
+        $authIncomingNames += $p.Name
+      }
+    }
+
+    $envVars = @()
+    $envFile = Join-Path $root 'env\env.json'
+    if (Test-Path -LiteralPath $envFile -PathType Leaf) {
+      $envData = Read-JsonFile $envFile
+      if (-not $envData.Ok -or $envData.Data -isnot [System.Management.Automation.PSCustomObject]) { throw "env\env.json в архиве повреждён или имеет неверный формат: $(Get-Prop $envData 'Error' 'неверный формат')" }
+      $envVars = @(Get-Prop $envData.Data 'vars' @())
+      foreach ($v in $envVars) {
+        $vname = [string](Get-Prop $v 'name' '')
+        $vvalue = Get-Prop $v 'value' $null
+        if ($vname -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or ($null -ne $vvalue -and $vvalue -isnot [string])) {
+          throw 'env\env.json содержит некорректное имя или нестроковое значение переменной.'
+        }
+        if ($vname -in 'Path', 'PATHEXT', 'COMSPEC', 'NODE_OPTIONS', 'PYTHONPATH', 'PYTHONHOME', 'LD_PRELOAD') {
+          throw "Переменная $vname не разрешена для импорта из архива."
+        }
+      }
+    }
+
+    $sessionMeta = Get-Prop $meta 'sessions' $null
+    $sessionFiles = @(Get-Prop $sessionMeta 'files' @())
+    $pendingSessions = @()
+    $targetCli = $null
+    $targetMajor = $null
+    if ($sessionFiles.Count -gt 0) {
+      $sourceMajor = [int](Get-Prop $sessionMeta 'sourceMajor' 0)
+      if ($sourceMajor -notin 1, 2) { throw 'manifest.sessions.sourceMajor отсутствует или не поддерживается.' }
+      $targetCli = Find-OpenCodeCli
+      $targetMajor = Get-OpenCodeMajor $targetCli
+      $existingIDs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+      foreach ($item in @(Get-OpenCodeSessions $targetCli $targetMajor)) { [void]$existingIDs.Add([string]$item.id) }
+      $archiveIDs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+      $candidates = @()
+      foreach ($name in $sessionFiles) {
+        if ([IO.Path]::GetFileName([string]$name) -ne [string]$name -or [string]$name -notmatch '^ses_[A-Za-z0-9_-]+\.json$') {
+          throw "Небезопасное имя файла диалога: $name"
+        }
+        $file = Join-Path (Join-Path $root 'sessions') $name
+        $parsed = Read-JsonFile $file
+        if (-not $parsed.Ok) { throw "Диалог $name повреждён: $($parsed.Error)" }
+        $data = $parsed.Data
+        $info = Get-Prop $data 'info' $null
+        $id = [string](Get-Prop $info 'id' '')
+        if ($id + '.json' -ne $name -or -not $archiveIDs.Add($id)) { throw "Некорректный или повторяющийся диалог: $name" }
+        if ($existingIDs.Contains($id)) {
+          Say "= ${id}: уже существует, локальный диалог сохранён" 'DarkGray'
+          continue
+        }
+        if ($sourceMajor -ne $targetMajor) {
+          if ($sourceMajor -eq 1 -and $targetMajor -eq 2) { $data = Convert-V1SessionToV2 $data $SessionDirectory }
+          elseif ($sourceMajor -eq 2 -and $targetMajor -eq 1) { $data = Convert-V2SessionToV1 $data $SessionDirectory }
+          else { throw "Перенос диалогов V$sourceMajor -> V$targetMajor не поддерживается." }
+          $convertedRoot = Join-Path $staging 'converted-sessions'
+          New-Item -ItemType Directory -Path $convertedRoot -Force | Out-Null
+          $file = Join-Path $convertedRoot $name
+          Write-JsonFile $file $data
+        }
+        $candidates += [pscustomobject]@{ ID = $id; ParentID = [string](Get-Prop $info 'parentID' ''); File = $file }
+      }
+      while ($candidates.Count -gt 0) {
+        $addedIDs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($item in $pendingSessions) { [void]$addedIDs.Add($item.ID) }
+        $next = $candidates | Where-Object {
+          -not $_.ParentID -or $existingIDs.Contains($_.ParentID) -or $addedIDs.Contains($_.ParentID)
+        } | Select-Object -First 1
+        if ($null -eq $next) { throw 'Не удалось упорядочить диалоги: отсутствует родительская сессия.' }
+        $pendingSessions += $next
+        $candidates = @($candidates | Where-Object { $_.ID -ne $next.ID })
+      }
+    }
+
     $archiveConfigDir = Join-Path $root 'config'
     $changes = @()
+    if ($pendingSessions.Count -and -not $DryRun) { Backup-SessionStorage $targetCli $targetMajor $paths }
 
     if (Test-Path -LiteralPath $archiveConfigDir -PathType Container) {
       if (-not (Test-Path -LiteralPath $paths.ConfigDir)) {
@@ -599,79 +1046,63 @@ function Invoke-Import {
         $names = @(Get-ChildItem -LiteralPath $archiveLocal -Force | ForEach-Object { $_.Name })
         $changes += "copy .opencode ($($names -join ', '))"
         Say "> .opencode: $($names -join ', ')" 'Cyan'
-        if (-not $DryRun) { Copy-DirectoryContents $archiveLocal $targetLocal | Out-Null }
-      }
-    }
-
-    $archiveAuth = Join-Path $root 'data\auth.json'
-    if (Test-Path -LiteralPath $archiveAuth -PathType Leaf) {
-      $incoming = Read-JsonFile $archiveAuth
-      if (-not $incoming.Ok) { throw 'data\auth.json в архиве повреждён.' }
-      if ($null -ne $incoming.Data) {
-        $merged = [ordered]@{}
-        if (Test-Path -LiteralPath $paths.AuthFile -PathType Leaf) {
-          $current = Read-JsonFile $paths.AuthFile
-          if ($current.Ok -and $null -ne $current.Data) {
-            foreach ($p in $current.Data.PSObject.Properties) { $merged[$p.Name] = $p.Value }
-          }
-        }
-        $incomingNames = @()
-        foreach ($p in $incoming.Data.PSObject.Properties) {
-          $merged[$p.Name] = $p.Value
-          $incomingNames += $p.Name
-        }
-        $changes += "auth.json += $($incomingNames -join ', ')"
-        Say "> auth.json: провайдеры $($incomingNames -join ', ')" 'Cyan'
         if (-not $DryRun) {
-          if (-not (Test-Path -LiteralPath $paths.DataDir)) { New-Item -ItemType Directory -Path $paths.DataDir -Force | Out-Null }
-          Backup-File $paths.AuthFile | Out-Null
-          Write-JsonFile $paths.AuthFile ([pscustomobject]$merged)
-          # Права: только текущий пользователь.
-          $icaclsOk = $false
-          try {
-            $null = icacls $paths.AuthFile /inheritance:r /grant:r "$($env:USERNAME):(F)" 2>&1
-            $icaclsOk = ($LASTEXITCODE -eq 0)
-          } catch { }
-          if (-not $icaclsOk) { Say '! Не удалось ограничить права на auth.json (не критично).' 'Yellow' }
+          Backup-Directory $targetLocal | Out-Null
+          Copy-DirectoryContentsAdditive $archiveLocal $targetLocal | Out-Null
         }
       }
     }
 
-    $envFile = Join-Path $root 'env\env.json'
-    if (Test-Path -LiteralPath $envFile -PathType Leaf) {
-      $envData = Read-JsonFile $envFile
-      $envVars = @(Get-Prop $envData.Data 'vars' @())
-      if ($envData.Ok -and $envVars.Count -gt 0) {
-        $envApplied = 0
-        foreach ($v in $envVars) {
-          $vname = Get-Prop $v 'name' $null
-          if ([string]::IsNullOrWhiteSpace($vname)) { continue }
-          $vscope = Get-Prop $v 'scope' 'User'
-          $vvalue = Get-Prop $v 'value' $null
-          if ($null -eq $vvalue) { continue }
+    if ($null -ne $authMerged) {
+      $changes += "auth.json += $($authIncomingNames -join ', ')"
+      Say "> auth.json: провайдеры $($authIncomingNames -join ', ')" 'Cyan'
+      if (-not $DryRun) {
+        if (-not (Test-Path -LiteralPath $paths.DataDir)) { New-Item -ItemType Directory -Path $paths.DataDir -Force | Out-Null }
+        Backup-File $paths.AuthFile | Out-Null
+        Write-JsonFile $paths.AuthFile ([pscustomobject]$authMerged)
+        # Права: только текущий пользователь.
+        $icaclsOk = $false
+        try {
+          $null = icacls $paths.AuthFile /inheritance:r /grant:r "$($env:USERNAME):(F)" 2>&1
+          $icaclsOk = ($LASTEXITCODE -eq 0)
+        } catch { }
+        if (-not $icaclsOk) { Say '! Не удалось ограничить права на auth.json (не критично).' 'Yellow' }
+      }
+    }
 
-          $current = Get-EnvPath $vname
-          if ((-not [string]::IsNullOrEmpty($current.Value)) -and -not $ForceEnv) {
-            Say "= ${vname}: уже задана, оставлена текущая (используйте -OverwriteEnv)" 'DarkGray'
-            continue
-          }
-          $changes += "env $vname"
-          Say "> env $vname (было: $vscope)" 'Cyan'
-          if (-not $DryRun -and $ApplyEnv) {
-            # Пишем в пользовательскую область: машинная требует прав администратора.
-            # Если переменная была машинной — пробуем обновить и её, но не падаем.
-            if ($vscope -eq 'Machine') {
-              try { [Environment]::SetEnvironmentVariable($vname, $vvalue, 'Machine') } catch { }
-            }
-            [Environment]::SetEnvironmentVariable($vname, $vvalue, 'User')
-            [Environment]::SetEnvironmentVariable($vname, $vvalue, 'Process')
-            $envApplied++
-            Say '  записано в область: User (запущенные приложения увидят после перезапуска)' 'DarkGray'
-          }
+    if ($envVars.Count -gt 0) {
+      foreach ($v in $envVars) {
+        $vname = Get-Prop $v 'name' $null
+        $vvalue = Get-Prop $v 'value' $null
+        if ($null -eq $vvalue) { continue }
+
+        $current = Get-EnvPath $vname
+        if ((-not [string]::IsNullOrEmpty($current.Value)) -and -not $ForceEnv) {
+          Say "= ${vname}: уже задана, оставлена текущая (используйте -OverwriteEnv)" 'DarkGray'
+          continue
         }
-        if (-not $ApplyEnv -and -not $DryRun) {
-          Say '  (переменные не применены: добавьте -SetEnv)' 'Yellow'
+        $changes += "env $vname"
+        Say "> env $vname" 'Cyan'
+        if (-not $DryRun -and $ApplyEnv) {
+          # Архив не управляет областью записи и окружением последующего CLI.
+          [Environment]::SetEnvironmentVariable($vname, $vvalue, 'User')
+          Say '  записано в область: User (запущенные приложения увидят после перезапуска)' 'DarkGray'
         }
+      }
+      if (-not $ApplyEnv -and -not $DryRun) {
+        Say '  (переменные не применены: добавьте -SetEnv)' 'Yellow'
+      }
+    }
+
+    foreach ($session in $pendingSessions) {
+      $changes += "session += $($session.ID)"
+      Say "> Диалог: $($session.ID)" 'Cyan'
+      if (-not $DryRun) {
+        if (-not (Test-Path -LiteralPath $SessionDirectory -PathType Container)) {
+          New-Item -ItemType Directory -Path $SessionDirectory -Force | Out-Null
+        }
+        $cliArgs = if ($targetMajor -eq 1) { @('import', $session.File) } else { @('session', 'import', $session.File, '--directory', $SessionDirectory) }
+        Invoke-OpenCodeNative -Cli $targetCli -CliArgs $cliArgs
       }
     }
 
@@ -745,7 +1176,7 @@ function Show-Menu {
 
 switch ($Mode) {
   'export' {
-    Invoke-Export -OutputPath $Out -SecretsMode $Secrets -EnvNames $EnvVars -HomeDir $HomeDir -DryRun:$DryRunExport | Out-Null
+    Invoke-Export -OutputPath $Out -SecretsMode $Secrets -EnvNames $EnvVars -HomeDir $HomeDir -SkipSessions:$SkipSessions -DryRun:$DryRunExport | Out-Null
   }
   'import' {
     if ([string]::IsNullOrWhiteSpace($Zip)) {
@@ -755,7 +1186,7 @@ switch ($Mode) {
       $Zip = $found
       Say "Архив по умолчанию: $Zip" 'DarkGray'
     }
-    Invoke-Import -ArchivePath $Zip -HomeDir $HomeDir -ApplyEnv:$SetEnv -ForceEnv:$OverwriteEnv -DryRun:$DryRun
+    Invoke-Import -ArchivePath $Zip -HomeDir $HomeDir -ApplyEnv:$SetEnv -ForceEnv:$OverwriteEnv -SessionDirectory $SessionDirectory -DryRun:$DryRun
   }
   default { Show-Menu }
 }

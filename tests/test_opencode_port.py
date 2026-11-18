@@ -39,20 +39,24 @@ def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
 
-def make_archive(path, config=None, auth=None, env_vars=None, sessions=None):
+def make_archive(path, config=None, auth=None, env_vars=None, sessions=None, source_major=2):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "opencode-port"
         if config is not None:
             (root / "config").mkdir(parents=True)
             (root / "config" / "opencode.json").write_text(config, encoding="utf-8")
         if auth is not None:
-            write_json(root / "data" / "auth.json", auth)
+            if isinstance(auth, str):
+                (root / "data").mkdir(parents=True, exist_ok=True)
+                (root / "data" / "auth.json").write_text(auth, encoding="utf-8")
+            else:
+                write_json(root / "data" / "auth.json", auth)
         if env_vars is not None:
             (root / "env").mkdir(parents=True)
             (root / "env" / "env.json").write_text(env_vars, encoding="utf-8")
         session_files = []
-        for index, session in enumerate(sessions or []):
-            name = f"session-{index}.json"
+        for session in sessions or []:
+            name = f"{session['info']['id']}.json"
             write_json(root / "sessions" / name, session)
             session_files.append(name)
         write_json(
@@ -61,7 +65,7 @@ def make_archive(path, config=None, auth=None, env_vars=None, sessions=None):
                 "format": "opencode-port",
                 "version": 2,
                 "providers": [],
-                "sessions": {"files": session_files},
+                "sessions": {"sourceMajor": source_major, "files": session_files},
             },
         )
         with zipfile.ZipFile(path, "w") as archive:
@@ -226,12 +230,22 @@ class PortTests(unittest.TestCase):
                 (state / "exported").mkdir(parents=True)
                 (state / "imported").mkdir()
                 (state / "opencode.db").write_bytes(b"synthetic database")
-                session = {"info": {"id": "ses_transfer", "title": "synthetic"}, "messages": [{"info": {"id": "msg_one"}, "parts": []}]}
+                if source_version.startswith("1."):
+                    session = {
+                        "info": {"id": "ses_transfer", "projectID": "prj_source", "slug": "test", "directory": str(source), "title": "synthetic", "version": "1.2.27", "time": {"created": 1, "updated": 2}},
+                        "messages": [{"info": {"id": "msg_one", "sessionID": "ses_transfer", "role": "user", "agent": "default", "model": {"providerID": "test", "modelID": "test"}, "time": {"created": 1}}, "parts": [{"id": "prt_one", "sessionID": "ses_transfer", "messageID": "msg_one", "type": "text", "text": "hello"}]}],
+                    }
+                else:
+                    session = {
+                        "info": {"id": "ses_transfer", "projectID": "prj_source", "title": "synthetic", "cost": 0, "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "location": {"directory": str(source)}, "time": {"created": 1, "updated": 2}},
+                        "messages": [{"id": "msg_one", "type": "user", "text": "hello", "time": {"created": 1}}],
+                    }
                 write_json(state / "exported" / "ses_transfer.json", session)
                 write_json(state / "imported" / "ses_existing.json", {"info": {"id": "ses_existing"}, "messages": []})
                 archive = case / "port.zip"
                 env = self.cli_env(source_version)
                 env["MOCK_OPENCODE_STATE"] = str(state)
+                env["MOCK_OPENCODE_ROLE"] = "source"
                 exported = run_port("export", "-Out", archive, "-HomeDir", source, "-Secrets", "None", env=env)
                 self.assertEqual(exported.returncode, 0, exported.stdout + exported.stderr)
                 with zipfile.ZipFile(archive) as zf:
@@ -239,12 +253,154 @@ class PortTests(unittest.TestCase):
                     self.assertEqual(json.loads(zf.read("opencode-port/sessions/ses_transfer.json")), session)
 
                 env["MOCK_OPENCODE_VERSION"] = target_version
+                env["MOCK_OPENCODE_ROLE"] = "target"
                 imported = run_port("import", "-Zip", archive, "-HomeDir", target, "-SessionDirectory", target / "work", env=env)
                 self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
-                self.assertEqual(json.loads((state / "imported" / "ses_transfer.json").read_text(encoding="utf-8")), session)
+                actual = json.loads((state / "imported" / "ses_transfer.json").read_text(encoding="utf-8"))
+                if source_version.startswith(target_version[0] + "."):
+                    self.assertEqual(actual, session)
+                elif target_version.startswith("2."):
+                    self.assertEqual(actual["messages"][0]["type"], "user")
+                    self.assertEqual(actual["messages"][0]["text"], "hello")
+                    self.assertIn("opencodePortV1", actual["info"]["metadata"])
+                else:
+                    self.assertEqual(actual["messages"][0]["info"]["role"], "user")
+                    self.assertEqual(actual["messages"][0]["parts"][0]["text"], "hello")
+                    self.assertIn("opencodePortV2", actual["info"]["metadata"])
                 self.assertTrue((state / "imported" / "ses_existing.json").exists())
                 backups = list(state.glob("opencode.db.*.bak"))
                 self.assertTrue(backups)
+    def test_invalid_auth_does_not_modify_config(self):
+        for local_invalid in (False, True):
+            with self.subTest(local_invalid=local_invalid):
+                case = self.base / f"auth-preflight-{local_invalid}"
+                target = case / "target"
+                config_path = target / ".config" / "opencode" / "opencode.json"
+                write_json(config_path, {"provider": {"local": {}}})
+                original = config_path.read_text(encoding="utf-8")
+                archive = case / "auth.zip"
+                incoming_auth = "{ broken" if not local_invalid else {"new": {"key": "new"}}
+                if local_invalid:
+                    auth_path = target / ".local" / "share" / "opencode" / "auth.json"
+                    auth_path.parent.mkdir(parents=True)
+                    auth_path.write_text("{ broken", encoding="utf-8")
+                make_archive(archive, '{"provider":{"new":{}}}', incoming_auth)
+
+                result = self.import_archive(archive, target)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+
+    def test_cross_version_external_attachment_reference_is_preserved(self):
+        session = {
+            "info": {"id": "ses_attachment", "projectID": "prj", "slug": "test", "directory": "C:\\old", "title": "test", "version": "1.2.27", "time": {"created": 1, "updated": 1}},
+            "messages": [{"info": {"id": "msg_attachment", "sessionID": "ses_attachment", "role": "user", "agent": "default", "model": {"providerID": "test", "modelID": "test"}, "time": {"created": 1}}, "parts": [{"id": "prt_file", "sessionID": "ses_attachment", "messageID": "msg_attachment", "type": "file", "mime": "application/pdf", "filename": "test.pdf", "url": "https://example.invalid/test.pdf"}]}],
+        }
+        archive = self.base / "attachment.zip"
+        make_archive(archive, "{}", sessions=[session], source_major=1)
+        env = self.cli_env("2.3.2")
+        env["MOCK_OPENCODE_ROLE"] = "target"
+
+        result = self.import_archive(archive, self.target, "-SessionDirectory", self.target / "work", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        imported = json.loads((self.mock_state / "imported" / "ses_attachment.json").read_text(encoding="utf-8"))
+        attachment = imported["messages"][0]["files"][0]
+        self.assertEqual(attachment["source"], {"type": "uri", "uri": "https://example.invalid/test.pdf"})
+        self.assertEqual(attachment["data"], "")
+
+    def test_valid_env_json_supports_dry_run_without_applying_variables(self):
+        name = "OPENCODE_PORT_TEST_UNUSED_VARIABLE"
+        archive = self.base / "valid-env.zip"
+        make_archive(archive, "{}", env_vars=json.dumps({"vars": [{"name": name, "scope": "Machine", "value": "synthetic"}]}))
+
+        result = self.import_archive(archive, self.target, "-DryRun")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(os.environ.get(name))
+
+    def test_unicode_session_export_round_trip(self):
+        text = "Привет, 世界"
+        session = {"info": {"id": "ses_unicode", "title": text}, "messages": [{"id": "msg_unicode", "type": "user", "text": text, "time": {"created": 1}}]}
+        write_json(self.mock_state / "exported" / "ses_unicode.json", session)
+        archive = self.base / "unicode.zip"
+        env = self.cli_env("2.3.2")
+
+        result = run_port("export", "-Out", archive, "-HomeDir", self.source, "-Secrets", "None", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with zipfile.ZipFile(archive) as zf:
+            exported = json.loads(zf.read("opencode-port/sessions/ses_unicode.json").decode("utf-8"))
+        self.assertEqual(exported["info"]["title"], text)
+        self.assertEqual(exported["messages"][0]["text"], text)
+
+    def test_cli_stderr_never_leaks_secret_values(self):
+        archive = self.base / "secret.zip"
+        env = self.cli_env("2.3.2")
+        env["MOCK_OPENCODE_FAIL_SECRET"] = "sk-synthetic-secret"
+
+        result = run_port("export", "-Out", archive, "-HomeDir", self.source, "-Secrets", "None", env=env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("sk-synthetic-secret", result.stdout + result.stderr)
+
+    def test_v2_streaming_tool_and_external_file_convert_to_v1(self):
+        session = {
+            "info": {"id": "ses_tool", "projectID": "prj", "time": {"created": 1, "updated": 1}},
+            "messages": [
+                {"id": "msg_user", "type": "user", "text": "test", "time": {"created": 1}, "files": [{"mime": "application/pdf", "name": "remote.pdf", "data": "", "source": {"type": "uri", "uri": "https://example.invalid/remote.pdf"}}]},
+                {"id": "msg_assistant", "type": "assistant", "agent": "default", "model": {"providerID": "test", "id": "test"}, "time": {"created": 2, "completed": 2}, "content": [{"type": "tool", "id": "call_one", "name": "read", "state": {"status": "streaming", "input": "{}"}, "time": {"created": 2}}]},
+            ],
+        }
+        archive = self.base / "tool.zip"
+        make_archive(archive, "{}", sessions=[session])
+        env = self.cli_env("1.2.27")
+        env["MOCK_OPENCODE_ROLE"] = "target"
+
+        result = self.import_archive(archive, self.target, "-SessionDirectory", self.target / "work", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        imported = json.loads((self.mock_state / "imported" / "ses_tool.json").read_text(encoding="utf-8"))
+        self.assertEqual(imported["messages"][0]["parts"][1]["url"], "https://example.invalid/remote.pdf")
+        self.assertEqual(imported["messages"][1]["parts"][0]["state"]["status"], "pending")
+
+    def test_existing_session_id_is_not_overwritten(self):
+        session = {"info": {"id": "ses_same", "title": "incoming"}, "messages": []}
+        write_json(self.mock_state / "imported" / "ses_same.json", {"info": {"id": "ses_same", "title": "local"}, "messages": []})
+        archive = self.base / "duplicate.zip"
+        make_archive(archive, "{}", sessions=[session])
+        env = self.cli_env("2.3.2")
+        env["MOCK_OPENCODE_ROLE"] = "target"
+
+        result = self.import_archive(archive, self.target, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        existing = json.loads((self.mock_state / "imported" / "ses_same.json").read_text(encoding="utf-8"))
+        self.assertEqual(existing["info"]["title"], "local")
+
+    def test_zip_entry_count_limit_is_enforced(self):
+        archive = self.base / "too-many.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            for index in range(10001):
+                zf.writestr(f"opencode-port/{index}.txt", "")
+
+        result = self.import_archive(archive)
+
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_child_session_is_imported_after_parent(self):
+        parent = {"info": {"id": "ses_parent", "projectID": "prj", "cost": 0, "tokens": {}, "location": {"directory": "C:\\old"}, "time": {"created": 1, "updated": 1}}, "messages": []}
+        child = {"info": {"id": "ses_child", "parentID": "ses_parent", "projectID": "prj", "cost": 0, "tokens": {}, "location": {"directory": "C:\\old"}, "time": {"created": 2, "updated": 2}}, "messages": []}
+        archive = self.base / "parents.zip"
+        make_archive(archive, "{}", sessions=[child, parent])
+        env = self.cli_env("2.3.2")
+        env["MOCK_OPENCODE_ROLE"] = "target"
+
+        result = self.import_archive(archive, self.target, "-SessionDirectory", self.target / "work", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        order = (self.mock_state / "import-order.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(order, ["ses_parent", "ses_child"])
 
 
 if __name__ == "__main__":
