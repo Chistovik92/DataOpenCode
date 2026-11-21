@@ -1,2 +1,14 @@
-*.docx
+# Сборки и временные файлы
 *.zip
+*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Кэш тестов
+.pytest_cache/
+
+# Локальные резервные копии скрипта
+*.bak
